@@ -36,8 +36,9 @@ const AppRouter = (props) => {
     showNotification: props.showNotification,
     showConfirmation: props.showConfirmationDialog,
     
-    // Función para crear reservas desde admin
     onSaveReservation: props.handleSaveReservation,
+    adminWorkDate: props.adminWorkDate,
+    onAdminWorkDateChange: props.onAdminWorkDateChange,
     
     // Props de estado faltantes
     editingReservation: props.editingReservation,
@@ -67,7 +68,13 @@ const AppRouter = (props) => {
     allReservations: props.allReservations,
     handleLogin: props.handleLogin,
     BACKGROUND_IMAGE_URL: props.BACKGROUND_IMAGE_URL,
-    LOGO_URL: props.LOGO_URL
+    LOGO_URL: props.LOGO_URL,
+    bookingPlanningSubmitted: props.bookingPlanningSubmitted,
+    setBookingPlanningSubmitted: props.setBookingPlanningSubmitted,
+    resetClientBookingFlow: props.resetClientBookingFlow,
+    handleCancelReservationPublic: props.handleCancelReservationPublic,
+    handleBeginReservationModification: props.handleBeginReservationModification,
+    clientCancelMinHoursBeforeStart: props.clientCancelMinHoursBeforeStart
   };
 
   return (

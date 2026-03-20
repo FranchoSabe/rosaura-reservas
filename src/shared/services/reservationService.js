@@ -11,13 +11,25 @@
  * ELIMINA duplicación de código y centraliza en un solo lugar.
  */
 
-import { addClient, addReservation, addWaitingReservation } from '../../firebase';
 import {
   calculateRealTableStates,
   assignTableAutomatically,
   validateTableAvailability,
   assignTableToNewReservation
 } from './tableManagementService';
+import {
+  insertReservationRecord,
+  insertWaitlistRecord,
+  fetchReservationScheduleForDateTurn,
+  fetchTenantReservationConfigMap,
+  fetchTableNumberToIdMap
+} from './supabaseReservationRepository';
+import {
+  computeReservationWindow,
+  slotsFromConfigRow,
+  getStayMinutesForTurn
+} from './reservationTimeWindows';
+import { RESTAURANT_TIMEZONE } from '../../lib/defaultTenantId';
 import {
   UNIFIED_TABLES_LAYOUT,
   UNIFIED_RESERVATION_ORDER,
@@ -26,119 +38,175 @@ import {
 import { isTurnoClosed } from '../constants/operatingDays';
 import { parsePhoneNumber } from 'react-phone-number-input';
 import { formatDateToString } from '../../utils';
+import { validateOnlineReservation } from '../../utils/timeValidation';
 
 // =================== CONFIGURACIÓN ===================
+
+let _configCache = { t: 0, map: null };
+async function getTenantConfigCached() {
+  if (Date.now() - _configCache.t < 60000 && _configCache.map) return _configCache.map;
+  const map = await fetchTenantReservationConfigMap();
+  _configCache = { t: Date.now(), map };
+  return map;
+}
+
+function normalizeCreateArgs(arg1, arg2) {
+  if (arg1 && typeof arg1 === 'object' && 'reservationData' in arg1) {
+    const { reservationData, ...rest } = arg1;
+    return { reservationData, options: rest };
+  }
+  return { reservationData: arg1, options: arg2 || {} };
+}
 
 // =================== FUNCIÓN PRINCIPAL ===================
 
 /**
- * FUNCIÓN PRINCIPAL: Crear reserva unificada
- * Usa el nuevo sistema de gestión de mesas para asignación automática
+ * Crear reserva unificada (Supabase). Acepta (data, options) o un solo objeto { reservationData, ... }.
  */
-export const createReservation = async (reservationData, options = {}) => {
+export const createReservation = async (arg1, arg2 = {}) => {
+  const { reservationData: rawData, options } = normalizeCreateArgs(arg1, arg2);
   const {
     isAdmin = false,
-    getAvailableSlots = null,
     existingReservations = [],
-    loadBlockedTables = null,
     existingOrders = [],
     manualBlocks = new Set()
   } = options;
-  try {
-    // Iniciando creación de reserva
 
-    // PASO 1: Validaciones iniciales
-    const validation = await validateReservationData(reservationData, getAvailableSlots, isAdmin);
+  try {
+    const validation = await validateReservationData(rawData, null, isAdmin);
     if (!validation.isValid) {
       throw new Error(validation.error);
     }
 
-    // PASO 2: Preparar datos del cliente (aún sin crearlo en la base)
-    const clientData = await prepareClientData(reservationData.cliente);
+    const clientData = await prepareClientData(rawData.cliente);
+    const clientPayload = { ...clientData };
+    delete clientPayload.createdAt;
+    delete clientPayload.updatedAt;
 
-    // PASO 3: Verificar disponibilidad con el sistema unificado
-    const fechaString = typeof reservationData.fecha === 'string'
-      ? reservationData.fecha
-      : formatDateToString(reservationData.fecha);
+    const fechaString =
+      typeof rawData.fecha === 'string' ? rawData.fecha : formatDateToString(rawData.fecha);
 
-    // PASO 3.1: Calcular estado real de las mesas
+    const config = await getTenantConfigCached();
+    const stay = getStayMinutesForTurn(config, rawData.turno);
+
+    let overlapCtx = null;
+    if (rawData.horario) {
+      const win = computeReservationWindow(fechaString, rawData.horario, stay, RESTAURANT_TIMEZONE);
+      overlapCtx = { id: '__new__', _startsMs: win.startsMs, _endsMs: win.endsMs };
+    }
+
     const realTableStates = calculateRealTableStates(
       existingReservations,
       existingOrders,
       manualBlocks,
       fechaString,
-      reservationData.turno
+      rawData.turno,
+      new Set(),
+      overlapCtx
     );
 
-    // PASO 3.2: Validar disponibilidad antes de crear la reserva
-    const availability = validateTableAvailability({
-      personas: reservationData.personas,
-      fecha: fechaString,
-      turno: reservationData.turno
-    }, realTableStates);
-
-    // Validación de disponibilidad realizada
-
-    // PASO 4: Decidir entre reserva confirmada o lista de espera
-    const shouldGoToWaitingList = !isAdmin && (
-      reservationData.willGoToWaitingList || 
-      !availability.hasAvailability
+    const availability = validateTableAvailability(
+      { personas: rawData.personas, fecha: fechaString, turno: rawData.turno },
+      realTableStates
     );
+
+    const shouldGoToWaitingList =
+      !isAdmin && (rawData.willGoToWaitingList || !availability.hasAvailability);
 
     if (shouldGoToWaitingList) {
-      // Crear cliente solo si realmente se almacenará la solicitud
-      const clientId = await addClient(clientData);
       return await createWaitingReservation({
-        reservationData: { ...reservationData, fecha: fechaString },
-        clientId,
-        clientData
+        reservationData: { ...rawData, fecha: fechaString },
+        clientData: clientPayload
       });
     }
 
-    // PASO 5: Asignar mesa automáticamente usando el sistema unificado
-    const tempReservation = {
-      ...reservationData,
-      fecha: fechaString
-    };
+    /** Cliente web (anon): mesa y ventana temporal vía RPC create_public_reservation (servidor). */
+    if (!isAdmin) {
+      const row = await insertReservationRecord({
+        businessDate: fechaString,
+        turno: rawData.turno,
+        horario: rawData.horario,
+        partySize: rawData.personas,
+        cliente: clientPayload,
+        mesaAsignadaLabel: null,
+        tableId: null,
+        configByTurno: config
+      });
 
+      const dataOut = {
+        reservationId: row.reservationId,
+        codigoReserva: row.reservationId,
+        mesaAsignada: row.mesaAsignada || 'Sin asignar',
+        fecha: fechaString,
+        turno: rawData.turno,
+        horario: rawData.horario,
+        personas: rawData.personas,
+        cliente: clientPayload,
+        starts_at: row.starts_at,
+        ends_at: row.ends_at
+      };
+
+      return {
+        success: true,
+        type: 'confirmed',
+        data: dataOut,
+        reservationId: row.reservationId,
+        mesaAsignada: row.mesaAsignada,
+        message: row.mesaAsignada
+          ? `Reserva confirmada para la mesa ${row.mesaAsignada}`
+          : 'Reserva confirmada; el restaurante asignará la mesa si hace falta.'
+      };
+    }
+
+    const tempReservation = { ...rawData, fecha: fechaString };
     const mesaAsignada = assignTableAutomatically(tempReservation, realTableStates);
 
-    if (!mesaAsignada && !isAdmin) {
-      // No crear cliente si no hay disponibilidad real
+    if (!mesaAsignada) {
       throw new Error('No hay mesas disponibles para esta reserva.');
     }
 
-    // PASO 6: Crear cliente en la base de datos
-    const clientId = await addClient(clientData);
+    const mapNums = await fetchTableNumberToIdMap();
+    let tableId = null;
+    if (mesaAsignada && !String(mesaAsignada).includes('+')) {
+      const n = parseInt(String(mesaAsignada), 10);
+      if (!Number.isNaN(n)) tableId = mapNums.get(n) || null;
+    }
 
-    // PASO 7: Crear la reserva final
-    const finalReservationData = {
-      clienteId: clientId,
-      cliente: clientData,
+    const label =
+      mesaAsignada == null ? 'Sin asignar' : String(mesaAsignada);
+
+    const row = await insertReservationRecord({
+      businessDate: fechaString,
+      turno: rawData.turno,
+      horario: rawData.horario,
+      partySize: rawData.personas,
+      cliente: clientPayload,
+      mesaAsignadaLabel: label === 'Sin asignar' ? null : label,
+      tableId,
+      configByTurno: config
+    });
+
+    const dataOut = {
+      reservationId: row.reservationId,
+      codigoReserva: row.reservationId,
+      mesaAsignada: row.mesaAsignada || 'Sin asignar',
       fecha: fechaString,
-      turno: reservationData.turno,
-      horario: reservationData.horario,
-      personas: reservationData.personas,
-      mesaAsignada: mesaAsignada || 'Sin asignar',
-      status: 'active',
-      estadoCheckIn: null,
-      createdAt: new Date(),
-      updatedAt: new Date()
+      turno: rawData.turno,
+      horario: rawData.horario,
+      personas: rawData.personas,
+      cliente: clientPayload
     };
-
-    const reservationId = await addReservation(finalReservationData);
 
     return {
       success: true,
       type: 'confirmed',
-      reservationId: reservationId,
-      mesaAsignada: mesaAsignada,
-      clientId: clientId,
-      message: mesaAsignada 
-        ? `Reserva confirmada para la mesa ${mesaAsignada}` 
+      data: dataOut,
+      reservationId: row.reservationId,
+      mesaAsignada: row.mesaAsignada,
+      message: row.mesaAsignada
+        ? `Reserva confirmada para la mesa ${row.mesaAsignada}`
         : 'Reserva confirmada sin asignación de mesa'
     };
-
   } catch (error) {
     console.error('❌ Error en creación de reserva:', error);
     throw error;
@@ -148,30 +216,32 @@ export const createReservation = async (reservationData, options = {}) => {
 /**
  * 🎯 Crear reserva en lista de espera
  */
-const createWaitingReservation = async ({ reservationData, clientId, clientData }) => {
+const createWaitingReservation = async ({ reservationData, clientData }) => {
   try {
-    const waitingData = {
-      clienteId: clientId,
-      cliente: clientData,
-      fecha: reservationData.fecha,
+    const w = await insertWaitlistRecord({
+      businessDate: reservationData.fecha,
       turno: reservationData.turno,
       horario: reservationData.horario || null,
-      personas: reservationData.personas,
-      status: 'pending',
-      createdAt: new Date(),
-      updatedAt: new Date()
-    };
+      partySize: reservationData.personas,
+      cliente: clientData
+    });
 
-    const waitingId = await addWaitingReservation(waitingData);
+    const dataOut = {
+      waitingId: w.waitingId,
+      willGoToWaitingList: true,
+      fecha: reservationData.fecha,
+      turno: reservationData.turno,
+      personas: reservationData.personas,
+      cliente: clientData
+    };
 
     return {
       success: true,
       type: 'waiting',
-      waitingId: waitingId,
-      clientId: clientId,
+      data: dataOut,
+      waitingId: w.waitingId,
       message: 'Solicitud agregada a la lista de espera. Te contactaremos si hay disponibilidad.'
     };
-
   } catch (error) {
     console.error('❌ Error en creación de reserva en lista de espera:', error);
     throw error;
@@ -207,6 +277,23 @@ const validateReservationData = async (reservationData, getAvailableSlots, isAdm
       return { isValid: false, error: 'Debe especificar el horario.' };
     }
 
+    // 🆕 VALIDACIÓN DE RESERVA ONLINE (solo para clientes)
+    if (!isAdmin) {
+      const onlineValidation = validateOnlineReservation(
+        reservationData.fecha, 
+        reservationData.turno
+      );
+      
+      if (!onlineValidation.isValid) {
+        return { 
+          isValid: false, 
+          error: onlineValidation.error,
+          needsWhatsApp: onlineValidation.needsWhatsApp,
+          suggestion: onlineValidation.suggestion
+        };
+      }
+    }
+
     // Validar teléfono de forma más permisiva
     if (reservationData.cliente.telefono) {
       try {
@@ -216,7 +303,7 @@ const validateReservationData = async (reservationData, getAvailableSlots, isAdm
           return { isValid: false, error: 'El formato del teléfono no es válido.' };
         }
         // Si parsePhoneNumber devuelve null/undefined, asumimos que es un formato local válido
-      } catch (error) {
+      } catch {
         // Si hay error en el parseo, verificar que al menos tenga números
         const hasNumbers = /\d{6,}/.test(reservationData.cliente.telefono);
         if (!hasNumbers) {
@@ -247,9 +334,8 @@ const prepareClientData = async (clienteData) => {
     if (phoneNumber && phoneNumber.isValid()) {
       formattedPhone = phoneNumber.formatInternational();
     }
-  } catch (error) {
-    // Si falla el formateo, usar el teléfono original
-    if (process.env.NODE_ENV !== 'production') {
+  } catch {
+    if (import.meta.env.DEV) {
       console.info('Usando teléfono sin formatear:', clienteData.telefono);
     }
   }
@@ -278,7 +364,8 @@ export const calculateAvailableSlots = async (
   excludeReservationId = null,
   existingReservations = [],
   loadBlockedTables = null,
-  isAdmin = false
+  isAdmin = false,
+  preferPublicScheduleRpc = false
 ) => {
   try {
     const fechaObj = new Date(fecha + 'T00:00:00');
@@ -292,20 +379,32 @@ export const calculateAvailableSlots = async (
       try {
         const blockedTablesForDate = await loadBlockedTables(fecha, turno);
         blockedTables = new Set(blockedTablesForDate || []);
-        // Si no hay bloqueos configurados específicamente, usar predeterminados
         if (blockedTables.size === 0) {
-          DEFAULT_WALKIN_TABLES.forEach(id => blockedTables.add(id));
+          DEFAULT_WALKIN_TABLES.forEach((id) => blockedTables.add(id));
         }
       } catch (error) {
         console.error('Error al cargar bloqueos del mapa:', error);
-        // En caso de error, usar configuración predeterminada
         blockedTables = new Set(DEFAULT_WALKIN_TABLES);
       }
     }
 
-    const reservasDelDia = existingReservations.filter(
-      r => r.fecha === fecha && r.turno === turno && r.id !== excludeReservationId
+    let reservasDelDia = existingReservations.filter(
+      (r) => r.fecha === fecha && r.turno === turno && r.id !== excludeReservationId && r.status !== 'cancelled'
     );
+
+    if (preferPublicScheduleRpc && !isAdmin) {
+      try {
+        reservasDelDia = await fetchReservationScheduleForDateTurn(fecha, turno);
+        reservasDelDia = reservasDelDia.filter((r) => r.id !== excludeReservationId);
+      } catch (e) {
+        console.error('RPC schedule:', e);
+      }
+    }
+
+    const config = await getTenantConfigCached();
+    const cfgRow = config[turno];
+    const fromCfg = cfgRow ? slotsFromConfigRow(cfgRow) : [];
+    const slotList = fromCfg.length > 0 ? fromCfg : DEFAULT_HORARIOS[turno] || [];
 
     const capacidadDisponible = calculateCapacityByTables(blockedTables);
     const reservasPorCategoria = countReservationsByCategory(reservasDelDia);
@@ -315,9 +414,9 @@ export const calculateAvailableSlots = async (
       : true;
 
     if (isAdmin || hayCapacidad) {
-      return DEFAULT_HORARIOS[turno].map(horario => {
-        const reservasHorario = reservasDelDia.filter(r => r.horario === horario);
-        const cuposOcupados = reservasHorario.reduce((t, r) => t + (r.personas || 0), 0);
+      return slotList.map((horario) => {
+        const reservasHorario = reservasDelDia.filter((r) => r.horario === horario);
+        const cuposOcupados = reservasHorario.reduce((t, r) => t + (r.personas || r.party_size || 0), 0);
         const maxCupos = calculateMaxCuposForHorario(capacidadDisponible);
         return {
           horario,
@@ -333,13 +432,13 @@ export const calculateAvailableSlots = async (
   }
 };
 
-export const assignTableAutomaticallyLegacy = (
+export const assignTableAutomaticallyLegacy = async (
   reservationData,
   existingReservations = [],
   blockedTables = new Set()
 ) => {
   try {
-    return assignTableToNewReservation(reservationData, existingReservations, blockedTables);
+    return await assignTableToNewReservation(reservationData, existingReservations, blockedTables);
   } catch (error) {
     console.error('Error en asignación automática:', error);
     return null;
@@ -349,9 +448,15 @@ export const assignTableAutomaticallyLegacy = (
 export const isValidReservationDate = (fecha, turno, isAdmin = false) => {
   if (isAdmin) return true;
   const fechaObj = new Date(fecha + 'T00:00:00');
+  
+  // Para comparaciones de fecha, usar medianoche (00:00:00)
   const today = new Date();
+  today.setHours(0, 0, 0, 0); // Establecer a medianoche
+  
   const maxDate = new Date();
   maxDate.setMonth(maxDate.getMonth() + 1);
+  maxDate.setHours(0, 0, 0, 0); // Establecer a medianoche
+  
   return fechaObj >= today && fechaObj <= maxDate && !isTurnoClosed(fechaObj.getDay(), turno);
 };
 
@@ -381,7 +486,16 @@ export const autoAssignAllPendingReservations = async (
     let noAsignadas = [];
 
     for (const reserva of reservasSinMesa) {
-      const mesaAsignada = assignTableAutomaticallyLegacy(reserva, reservations, blockedTables);
+      const tableStates = calculateRealTableStates(
+        reservations,
+        [],
+        blockedTables,
+        fecha,
+        turno,
+        new Set(),
+        reserva
+      );
+      const mesaAsignada = assignTableAutomatically(reserva, tableStates);
       if (mesaAsignada) {
         await onUpdateReservation(reserva.id, { mesaAsignada }, true);
         asignadas++;

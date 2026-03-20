@@ -4,53 +4,67 @@ import { LoginView } from './apps/client/pages/Login/LoginView';
 import AppRouter from './router/AppRouter';
 import { NotificationContainer, ConfirmationModal } from './shared/components/ui';
 import { 
-  addClient, 
   updateClientBlacklist, 
   updateClientNotes,
+  subscribeToClients,
+  auth 
+} from './firebase';
+import {
+  subscribeToReservationsByDate,
+  subscribeToWaitingReservationsByDate,
   updateReservation,
   deleteReservation,
   searchReservation,
-  subscribeToReservations, 
-  subscribeToReservationsByDate,
-  subscribeToClients,
-  addWaitingReservation,
-  subscribeToWaitingReservations,
+  cancelReservationPublic,
   confirmWaitingReservation,
   deleteWaitingReservation,
   markWaitingAsNotified,
   contactWaitingClient,
   rejectWaitingReservation,
-  auth 
-} from './firebase';
+  saveTableBlocksForDateTurno,
+  loadTableBlocksForDateTurno
+} from './shared/data/reservationsDataLayer';
+import {
+  ensureSupabaseStaffSession,
+  signOutSupabaseAuth,
+  fetchTenantReservationConfigMap,
+  fetchReservationScheduleForDateTurn,
+  fetchPilotTenantClientSettings
+} from './shared/services/supabaseReservationRepository';
+import { CLIENT_CANCEL_MIN_HOURS_BEFORE_START } from './shared/constants/clientReservation';
+import { slotsFromConfigRow } from './shared/services/reservationTimeWindows';
 import { assignTableToNewReservation } from './shared/services/tableManagementService';
-import { UNIFIED_TABLES_LAYOUT as TABLES_LAYOUT, DEFAULT_WALKIN_TABLES } from './utils/tablesLayout';
+import { DEFAULT_WALKIN_TABLES } from './utils/tablesLayout';
 import { signInWithEmailAndPassword, signOut } from 'firebase/auth';
 
 import { formatDateToString } from './utils';
-import { db } from './firebase';
-import { isTurnoClosed, getAvailableHours } from './shared/constants/operatingDays';
+import { validateOnlineReservation, getReservationLimitsInfo, generateWhatsAppMessage } from './utils/timeValidation';
+import { isTurnoClosed } from './shared/constants/operatingDays';
 import { calculateAvailableSlots, isValidReservationDate } from './shared/services/reservationService';
 import { createReservation } from './shared/services/reservationService';
 
 // --- CONFIGURACIÓN Y DATOS ---
 const LOGO_URL = null; // Usamos texto con tipografía Daniel en lugar de imagen
 const BACKGROUND_IMAGE_URL = '/fondo.jpg';
-const HORARIOS = {
-    mediodia: ['12:00', '12:30', '13:00', '13:30', '14:00'],
-    noche: ['20:00', '20:15', '20:30', '20:45', '21:00', '21:15']
+const FALLBACK_HORARIOS = {
+    mediodia: ['12:00', '12:30', '13:00', '13:30', '14:00', '14:30', '15:00'],
+    noche: ['19:00', '19:30', '20:00', '20:30', '21:00', '21:30', '22:00', '22:30']
 };
 
 function App() {
   const [authState, setAuthState] = useState(null);
   const [data, setData] = useState({ reservas: [], clientes: [], waitingList: [] });
+  const [adminWorkDate, setAdminWorkDate] = useState(() => new Date().toISOString().split('T')[0]);
+  const [HORARIOS, setHORARIOS] = useState(FALLBACK_HORARIOS);
   const [currentScreen, setCurrentScreen] = useState('landing');
   const [reservaData, setReservaData] = useState({
     fecha: '',
     personas: 0,
     turno: '',
     horario: '',
-    cliente: { nombre: '', telefono: '', comentarios: '' } // Removido codigoPais
+    cliente: { nombre: '', telefono: '', comentarios: '', email: '' }
   });
+  const [bookingPlanningSubmitted, setBookingPlanningSubmitted] = useState(false);
   const [availableSlots, setAvailableSlots] = useState([]);
   const [showConfirmation, setShowConfirmation] = useState(false);
   const [showReservationModal, setShowReservationModal] = useState(false);
@@ -61,32 +75,49 @@ function App() {
   const [notifications, setNotifications] = useState([]);
   const [confirmation, setConfirmation] = useState(null);
   const [editingReservation, setEditingReservation] = useState(null);
-  
-  // 🎯 Suscribirse a reservas del día actual únicamente 
+  const [clientCancelMinHoursBeforeStart, setClientCancelMinHoursBeforeStart] = useState(
+    CLIENT_CANCEL_MIN_HOURS_BEFORE_START
+  );
+
   useEffect(() => {
-    // Obtener fecha actual en formato YYYY-MM-DD
-    const today = new Date().toISOString().split('T')[0];
-    
-    // Reservas del día se cargan automáticamente
+    fetchTenantReservationConfigMap()
+      .then((m) => {
+        const md = m.mediodia ? slotsFromConfigRow(m.mediodia) : [];
+        const nc = m.noche ? slotsFromConfigRow(m.noche) : [];
+        setHORARIOS({
+          mediodia: md.length ? md : FALLBACK_HORARIOS.mediodia,
+          noche: nc.length ? nc : FALLBACK_HORARIOS.noche
+        });
+      })
+      .catch(() => {});
+    fetchPilotTenantClientSettings()
+      .then((s) => {
+        if (s?.clientCancelMinHoursBeforeStart != null) {
+          setClientCancelMinHoursBeforeStart(s.clientCancelMinHoursBeforeStart);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
     const unsubscribeReservations = subscribeToReservationsByDate((reservas) => {
-      setData(prev => ({ ...prev, reservas }));
-    }, today);
+      setData((prev) => ({ ...prev, reservas }));
+    }, adminWorkDate);
+
+    const unsubscribeWaitingList = subscribeToWaitingReservationsByDate((waitingList) => {
+      setData((prev) => ({ ...prev, waitingList }));
+    }, adminWorkDate);
 
     const unsubscribeClients = subscribeToClients((clientes) => {
-      setData(prev => ({ ...prev, clientes }));
+      setData((prev) => ({ ...prev, clientes }));
     });
 
-    const unsubscribeWaitingList = subscribeToWaitingReservations((waitingList) => {
-      setData(prev => ({ ...prev, waitingList }));
-    });
-
-    // Limpiar suscripciones al desmontar
     return () => {
       unsubscribeReservations();
-      unsubscribeClients();
       unsubscribeWaitingList();
+      unsubscribeClients();
     };
-  }, []); // Solo ejecutar una vez al montar el componente
+  }, [adminWorkDate]);
 
   // 🔔 SISTEMA DE NOTIFICACIONES MEJORADO
   // Categorías de notificaciones con diferentes comportamientos
@@ -180,107 +211,6 @@ function App() {
     setConfirmation(null);
   }, [confirmation]);
 
-  const getAvailableSlotsDynamic = async (fecha, turno) => {
-    const fechaObj = new Date(fecha + "T00:00:00");
-    const dayOfWeek = fechaObj.getDay();
-    
-    // Usar nueva función unificada para verificar si está cerrado
-    if (isTurnoClosed(dayOfWeek, turno)) {
-      return []; // Día/turno cerrado según configuración
-    }
-    
-    try {
-      // Cargar bloqueos específicos para esta fecha/turno
-      const blockedTablesForDate = await handleLoadBlockedTables(fecha, turno);
-      const blockedSet = new Set(blockedTablesForDate || []);
-      
-      // Si no hay bloqueos guardados específicamente, usar configuración predeterminada
-      if (blockedSet.size === 0) {
-        DEFAULT_WALKIN_TABLES.forEach(id => blockedSet.add(id));
-      }
-      
-      // Obtener reservas existentes para esta fecha/turno
-      const reservasDelDia = data.reservas.filter(
-        r => r.fecha === fecha && r.turno === turno
-      );
-      
-      // Calcular capacidad dinámica basada en mesas disponibles (no bloqueadas)
-      const capacidadDisponible = {
-        pequena: 0, // Para 1-2 personas
-        mediana: 0, // Para 3-4 personas  
-        grande: 0   // Para 5-6 personas
-      };
-      
-      // Contar mesas disponibles por capacidad
-      TABLES_LAYOUT.forEach(mesa => {
-        if (!blockedSet.has(mesa.id)) {
-          if (mesa.capacity <= 2) capacidadDisponible.pequena++;
-          else if (mesa.capacity <= 4) capacidadDisponible.mediana++;
-          else capacidadDisponible.grande++;
-        }
-      });
-      
-      // Verificar si la combinación Mesa 2+3 está disponible para aumentar capacidad grande
-      const mesa2Available = !blockedSet.has(2);
-      const mesa3Available = !blockedSet.has(3);
-      if (mesa2Available && mesa3Available) {
-        capacidadDisponible.grande++; // Añadir una capacidad más para la combinación 2+3
-      }
-      
-      // Contar mesas ya ocupadas por reservas, considerando combinaciones
-      const mesasOcupadas = {
-        pequena: 0,
-        mediana: 0,
-        grande: 0
-      };
-      
-      // Contar también mesas que están asignadas (incluye combinaciones)
-      const mesasAsignadas = new Set();
-      
-      reservasDelDia.forEach(reserva => {
-        if (reserva.personas <= 2) mesasOcupadas.pequena++;
-        else if (reserva.personas <= 4) mesasOcupadas.mediana++;
-        else mesasOcupadas.grande++;
-        
-        // Registrar mesas asignadas para verificar disponibilidad real
-        if (reserva.mesaAsignada) {
-          if (typeof reserva.mesaAsignada === 'string' && reserva.mesaAsignada.includes('+')) {
-            // Es una combinación, marcar ambas mesas como ocupadas
-            const tableIds = reserva.mesaAsignada.split('+').map(id => parseInt(id));
-            tableIds.forEach(id => mesasAsignadas.add(id));
-          } else {
-            mesasAsignadas.add(parseInt(reserva.mesaAsignada));
-          }
-        }
-      });
-      
-      // Verificar específicamente si la combinación 2+3 está disponible
-      const mesa2Ocupada = mesasAsignadas.has(2) || blockedSet.has(2);
-      const mesa3Ocupada = mesasAsignadas.has(3) || blockedSet.has(3);
-      const combinacion23Disponible = !mesa2Ocupada && !mesa3Ocupada;
-      
-      // Ajustar capacidad grande si la combinación 2+3 no está disponible
-      if (!combinacion23Disponible && capacidadDisponible.grande > 1) {
-        capacidadDisponible.grande--; // Reducir capacidad si la combinación no está disponible
-      }
-      
-      // Verificar si hay capacidad disponible para el tamaño de reserva actual
-      const hayCapacidad = 
-        (reservaData.personas <= 2 && mesasOcupadas.pequena < capacidadDisponible.pequena) ||
-        (reservaData.personas <= 4 && mesasOcupadas.mediana < capacidadDisponible.mediana) ||
-        (reservaData.personas > 4 && mesasOcupadas.grande < capacidadDisponible.grande);
-      
-      // Si hay capacidad, devolver todos los horarios disponibles
-      return hayCapacidad ? HORARIOS[turno] : [];
-      
-    } catch (error) {
-      console.error('Error al cargar bloqueos para cupos dinámicos:', error);
-      // Fallback al sistema anterior en caso de error - convertir a formato simple
-      const slots = await getAvailableSlots(fecha, turno);
-      return slots.map(slot => slot.horario);
-    }
-  };
-
   const getAvailableSlots = async (fecha, turno) => {
     const fechaObj = new Date(fecha + "T00:00:00");
     const dayOfWeek = fechaObj.getDay();
@@ -313,16 +243,29 @@ function App() {
   };
 
   // FUNCIÓN SIMPLIFICADA: Usar lógica unificada
-  const getAvailableSlotsDynamicSimplified = async (fecha, turno) => {
+  const getAvailableSlotsDynamicSimplified = async (fecha, turno, personasOverride) => {
     return await calculateAvailableSlots(
       fecha,
       turno,
-      reservaData?.personas || null,
-      null, // Sin exclusión de reserva
+      personasOverride ?? reservaData?.personas ?? null,
+      null,
       data.reservas,
       handleLoadBlockedTables,
-      false // No es admin mode
+      false,
+      true
     );
+  };
+
+  const resetClientBookingFlow = () => {
+    setBookingPlanningSubmitted(false);
+    setAvailableSlots([]);
+    setReservaData({
+      fecha: '',
+      personas: 0,
+      turno: '',
+      horario: '',
+      cliente: { nombre: '', telefono: '', comentarios: '', email: '' }
+    });
   };
 
   const getAvailableSlotsForEdit = async (fecha, turno, personas, excludeReservationId) => {
@@ -358,8 +301,17 @@ function App() {
       }
 
       const userCredential = await signInWithEmailAndPassword(auth, email, password);
-      const user = userCredential.user;
-      
+      void userCredential.user;
+
+      const supa = await ensureSupabaseStaffSession();
+      if (!supa.ok && import.meta.env.DEV) {
+        console.warn(
+          '[Supabase] Sesión staff no iniciada:',
+          supa.error,
+          'Configurá VITE_SUPABASE_STAFF_EMAIL / VITE_SUPABASE_STAFF_PASSWORD'
+        );
+      }
+
       setAuthState({ user: username, role });
       return null; // Login exitoso
     } catch (error) {
@@ -371,6 +323,7 @@ function App() {
   const handleLogout = async () => {
     try {
       await signOut(auth);
+      await signOutSupabaseAuth();
       setAuthState(null);
     } catch (error) {
       console.error("Error al cerrar sesión:", error);
@@ -408,28 +361,65 @@ function App() {
       alert('Por favor, seleccioná un turno.');
       return;
     }
+    
+    // 🆕 VALIDACIÓN DE TURNO COMPLETA - Verificar si se puede reservar online
+    const validation = validateOnlineReservation(fechaString, reservaData.turno);
+    
+    if (!validation.isValid) {
+      if (validation.needsWhatsApp) {
+        // Mostrar popup para ofrecer WhatsApp
+        const shouldUseWhatsApp = window.confirm(
+          `${validation.error}\n\n${validation.suggestion}\n\n¿Quieres contactarnos por WhatsApp para hacer la reserva?`
+        );
+        
+        if (shouldUseWhatsApp) {
+          const message = generateWhatsAppMessage(
+            fechaString, 
+            reservaData.turno, 
+            reservaData.personas,
+            reservaData.cliente?.nombre || ''
+          );
+          const encodedMessage = encodeURIComponent(message);
+          window.open(`https://wa.me/5492213995351?text=${encodedMessage}`, '_blank');
+        }
+        return;
+      } else {
+        alert(validation.error);
+        return;
+      }
+    }
+    
+    // Si llegamos aquí, el turno está disponible para reserva online
     // Usar el sistema dinámico de cupos que respeta los bloqueos
-          const slots = await getAvailableSlotsDynamicSimplified(fechaString, reservaData.turno);
+    const slots = await getAvailableSlotsDynamicSimplified(fechaString, reservaData.turno);
     
     // Si no hay slots disponibles, ir directamente a recopilar datos para lista de espera
     if (slots.length === 0) {
-      // Actualizar estado para indicar que iremos a lista de espera
       setReservaData(prev => ({
         ...prev,
         fecha: fechaString,
         willGoToWaitingList: true
       }));
-      setCurrentScreen('contacto'); // Ir directo a contacto para recopilar datos
+      setBookingPlanningSubmitted(true);
+      setCurrentScreen('reserva-flow');
       return;
     }
     
+    // Guardar información de límites para mostrar en UI
+    const limitsInfo = getReservationLimitsInfo();
+    setReservaData(prev => ({
+      ...prev,
+      fecha: fechaString,
+      limitsInfo
+    }));
+    
     setAvailableSlots(slots);
-    setCurrentScreen('horario');
+    setBookingPlanningSubmitted(true);
+    setCurrentScreen('reserva-flow');
   };
 
   const handleHorarioSelect = (selectedHorario) => {
     setReservaData(prev => ({ ...prev, horario: selectedHorario }));
-    setCurrentScreen('contacto');
   };
 
   const handleContactoSubmit = async () => {
@@ -440,12 +430,18 @@ function App() {
     try {
       console.log('🔄 Creando reserva desde cliente con servicio unificado:', reservaData);
       
+      const fechaString = formatDateToString(reservaData.fecha);
+      const existingForDay = await fetchReservationScheduleForDateTurn(
+        fechaString,
+        reservaData.turno
+      );
+
       const result = await createReservation({
         reservationData: reservaData,
-        existingReservations: data.reservas,
+        existingReservations: existingForDay,
         getAvailableSlots: getAvailableSlotsDynamicSimplified,
         loadBlockedTables: handleLoadBlockedTables,
-        isAdmin: false // Modo cliente: validaciones estrictas
+        isAdmin: false
       });
 
       if (!result.success) {
@@ -501,12 +497,17 @@ function App() {
     try {
       console.log('🔄 Creando reserva desde admin con servicio unificado:', reservationData);
       
+      const f = formatDateToString(reservationData.fecha);
+      const existingReservations = data.reservas.filter(
+        (r) => r.fecha === f && r.turno === reservationData.turno
+      );
+
       const result = await createReservation({
         reservationData,
-        existingReservations: data.reservas,
+        existingReservations,
         getAvailableSlots,
         loadBlockedTables: handleLoadBlockedTables,
-        isAdmin: true // Modo admin: sin restricciones estrictas
+        isAdmin: true
       });
 
       if (!result.success) {
@@ -601,14 +602,18 @@ function App() {
         }
       }
 
-      const slots = getAvailableSlotsForEdit(
+      const slots = await getAvailableSlotsForEdit(
         fechaString,
         fullData.turno,
         fullData.personas,
         reservationId
       );
 
-      if (!adminOverride && !slots.includes(fullData.horario)) {
+      const horarioOk =
+        adminOverride ||
+        (Array.isArray(slots) &&
+          slots.some((s) => s.horario === fullData.horario || s === fullData.horario));
+      if (!horarioOk) {
         throw new Error('El horario seleccionado no está disponible. Por favor, elige otro horario.');
       }
 
@@ -660,13 +665,69 @@ function App() {
     }
   };
 
+  const handleCancelReservationPublic = async (code, phoneDigits) => {
+    try {
+      await cancelReservationPublic(code, phoneDigits);
+      showNotification('Reserva cancelada.', 'info');
+      return true;
+    } catch (error) {
+      console.error('Cancelación pública:', error);
+      const msg = error?.message || '';
+      if (msg.includes('cancel_too_late') || msg.includes('too_late')) {
+        const h = clientCancelMinHoursBeforeStart;
+        alert(
+          h <= 0
+            ? 'No se puede cancelar online en este momento según el horario de tu reserva. Contactanos por WhatsApp.'
+            : `No se puede cancelar online: hace falta al menos ${h} h de antelación. Contactanos por WhatsApp.`
+        );
+      } else if (msg.includes('invalid_phone_length')) {
+        alert('El teléfono debe tener al menos 8 dígitos para verificar la cancelación.');
+      } else if (msg.includes('phone_mismatch')) {
+        alert('El teléfono no coincide con la reserva.');
+      } else if (msg.includes('reservation_not_found') || msg.includes('not_found')) {
+        alert('No encontramos esa reserva o ya fue cancelada.');
+      } else {
+        alert('No se pudo cancelar. Intentá de nuevo o contactanos por WhatsApp.');
+      }
+      return false;
+    }
+  };
+
+  const handleBeginReservationModification = async (reservation) => {
+    const reservationDate = new Date(`${reservation.fecha}T00:00:00`);
+    const fechaString = reservation.fecha;
+    const turno = reservation.turno;
+    const slots = await getAvailableSlotsDynamicSimplified(
+      fechaString,
+      turno,
+      reservation.personas
+    );
+    setReservaData({
+      ...reservation,
+      fecha: reservationDate,
+      isModifying: true,
+      cliente: {
+        nombre: reservation.cliente?.nombre || '',
+        telefono: reservation.cliente?.telefono || '',
+        comentarios: reservation.cliente?.comentarios || '',
+        email: reservation.cliente?.email || ''
+      },
+      willGoToWaitingList: slots.length === 0,
+      limitsInfo: getReservationLimitsInfo()
+    });
+    setAvailableSlots(slots);
+    setBookingPlanningSubmitted(true);
+    setCurrentScreen('reserva-flow');
+  };
+
   // === FUNCIONES PARA LISTA DE ESPERA ===
   
   const handleConfirmWaitingReservation = async (waitingReservationId, waitingData, selectedHorario, currentBlocked = null) => {
     try {
       // Verificar que aún hay cupo disponible antes de confirmar
       const slotsDisponibles = await getAvailableSlots(waitingData.fecha, waitingData.turno);
-      if (slotsDisponibles.length === 0) {
+      const hayCupo = slotsDisponibles.some((s) => s.cuposDisponibles > 0);
+      if (!hayCupo) {
         throw new Error('Ya no hay cupos disponibles para este turno.');
       }
 
@@ -676,18 +737,25 @@ function App() {
         horario: selectedHorario
       };
 
-      // Usar bloqueos específicos del turno si están disponibles, sino usar predeterminados
       let blockedTables = currentBlocked;
       if (!blockedTables) {
-        blockedTables = new Set(DEFAULT_WALKIN_TABLES); // Usar configuración predeterminada
+        blockedTables = new Set(DEFAULT_WALKIN_TABLES);
       }
+      const blockedSet =
+        blockedTables instanceof Set ? blockedTables : new Set(blockedTables || []);
 
-      // Filtrar reservas del mismo turno y fecha para verificar conflictos
       const reservasDelTurno = data.reservas.filter(
-        r => r.fecha === waitingData.fecha && r.turno === waitingData.turno
+        (r) => r.fecha === waitingData.fecha && r.turno === waitingData.turno
       );
 
-      const mesaAsignada = assignTableToNewReservation(tempReservationData, reservasDelTurno, blockedTables);
+      let mesaAsignada = waitingData.mesaAsignada;
+      if (!mesaAsignada || mesaAsignada === 'Sin asignar') {
+        mesaAsignada = await assignTableToNewReservation(
+          tempReservationData,
+          reservasDelTurno,
+          blockedSet
+        );
+      }
 
       // Limpiar objeto cliente de la waiting list
       const cleanClienteWaiting = {};
@@ -760,27 +828,17 @@ function App() {
   // === FUNCIONES PARA BLOQUEOS DE MESAS ===
   
   const handleSaveBlockedTables = async (fecha, turno, blockedTablesArray) => {
-    try {
-      // Aquí deberías implementar la lógica para guardar en tu base de datos
-      // Por ahora, usaremos localStorage como ejemplo
-      const key = `blockedTables_${fecha}_${turno}`;
-      localStorage.setItem(key, JSON.stringify(blockedTablesArray));
-      return true;
-    } catch (error) {
-      console.error("Error al guardar bloqueos de mesas:", error);
-      throw error;
-    }
+    await saveTableBlocksForDateTurno(fecha, turno, blockedTablesArray);
+    return true;
   };
 
   const handleLoadBlockedTables = async (fecha, turno) => {
     try {
-      // Aquí deberías implementar la lógica para cargar desde tu base de datos
-      // Por ahora, usaremos localStorage como ejemplo
-      const key = `blockedTables_${fecha}_${turno}`;
-      const saved = localStorage.getItem(key);
-      return saved ? JSON.parse(saved) : null;
+      const cfg = await loadTableBlocksForDateTurno(fecha, turno);
+      const arr = cfg?.blockedTables ? Array.from(cfg.blockedTables) : [];
+      return arr.length ? arr : null;
     } catch (error) {
-      console.error("Error al cargar bloqueos de mesas:", error);
+      console.error('Error al cargar bloqueos de mesas:', error);
       return null;
     }
   };
@@ -795,6 +853,8 @@ function App() {
       <AppRouter
       // Props para auth state
       authState={authState}
+      adminWorkDate={adminWorkDate}
+      onAdminWorkDateChange={setAdminWorkDate}
       
       // Props para admin
       data={data}
@@ -845,6 +905,12 @@ function App() {
       waitingList={data.waitingList || []}
       allReservations={data.reservas || []}
       handleLogin={handleLogin}
+      bookingPlanningSubmitted={bookingPlanningSubmitted}
+      setBookingPlanningSubmitted={setBookingPlanningSubmitted}
+      resetClientBookingFlow={resetClientBookingFlow}
+      handleCancelReservationPublic={handleCancelReservationPublic}
+      handleBeginReservationModification={handleBeginReservationModification}
+      clientCancelMinHoursBeforeStart={clientCancelMinHoursBeforeStart}
       />
       
       {/* Componentes de UI globales */}

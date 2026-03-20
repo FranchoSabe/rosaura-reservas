@@ -2,26 +2,19 @@ import React from 'react';
 import styles from './ProgressIndicator.module.css';
 
 /**
- * 📊 COMPONENTE PROGRESS INDICATOR SIMPLE
- * Línea recta con checkpoints que se van coloreando
- * 
- * Pasos del flujo:
- * 1. fecha - Selección de fecha
- * 2. turno - Selección de turno 
- * 3. personas - Cantidad de personas
- * 4. contacto - Datos de contacto
+ * Progreso del flujo web (3 pasos lógicos): datos → horario/cupos → contacto.
+ * La UI puede ser una sola vista con revelado progresivo; el indicador refleja la fase.
  */
 
 const ProgressIndicator = ({
-  currentStep = 'fecha',
+  currentStep = 'reserva',
   className = '',
   ...props
 }) => {
   
   const steps = [
-    { id: 'fecha', label: 'Fecha' },
-    { id: 'turno', label: 'Turno' },
-    { id: 'personas', label: 'Personas' },
+    { id: 'reserva', label: 'Tu reserva' },
+    { id: 'horario', label: 'Horario' },
     { id: 'contacto', label: 'Contacto' }
   ];
 

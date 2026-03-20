@@ -35,7 +35,7 @@ export const isTurnoClosed = (dayOfWeek, turno) => {
 
 export const RESTAURANT_CONFIG = {
   name: 'Rosaura',
-  phone: '+5491234567890',
+  phone: '+5492213995351', // Número real de WhatsApp
   email: 'info@rosaura.com',
   address: 'Dirección del restaurante',
   
@@ -58,6 +58,30 @@ export const RESTAURANT_CONFIG = {
     maxPersonsPerReservation: 6,
     tablesCount: 24,
     walkInTables: [4, 5, 14, 24] // Mesas reservadas para walk-ins
+  },
+
+  // 🆕 LÍMITES DE RESERVAS ONLINE
+  reservationLimits: {
+    // Horarios límite para reservas online (horario de Argentina)
+    cutoffTimes: {
+      mediodia: '12:00', // Hasta las 12:00 se puede reservar mediodía online
+      noche: '19:00'     // Hasta las 19:00 se puede reservar noche online
+    },
+    
+    // Tiempo máximo para reservar (en días)
+    maximumAdvanceDays: 30,
+    
+    // Mensajes para WhatsApp según el turno
+    whatsappMessages: {
+      mediodia: 'Hola! Quiero hacer una reserva para el turno mediodía. ',
+      noche: 'Hola! Quiero hacer una reserva para el turno noche. '
+    },
+    
+    // Explicaciones para mostrar al usuario
+    explanations: {
+      mediodia: 'Las reservas para mediodía se pueden hacer online hasta las 12:00 hs',
+      noche: 'Las reservas para noche se pueden hacer online hasta las 19:00 hs'
+    }
   }
 };
 

@@ -13,12 +13,16 @@
 
 import { UNIFIED_TABLES_LAYOUT } from '../../utils/tablesLayout';
 import reservationOrderConfig from '../../config/reservationOrder.json';
+import { intervalsOverlap, computeReservationWindow, getStayMinutesForTurn } from './reservationTimeWindows';
+import { fetchTenantReservationConfigMap } from './supabaseReservationRepository';
+import { RESTAURANT_TIMEZONE } from '../../lib/defaultTenantId';
+import { formatDateToString } from '../../utils';
 
 let UNIFIED_RESERVATION_ORDER = reservationOrderConfig;
 
 // Helper for debug logging
 const debugLog = (...args) => {
-  if (process.env.NODE_ENV !== 'production') {
+  if (import.meta.env.DEV) {
     console.log(...args);
   }
 };
@@ -58,7 +62,20 @@ export const TABLE_STATES = {
  * FUNCIÓN CENTRAL: Calcular estado real de todas las mesas
  * Esta es la ÚNICA fuente de verdad para el estado de las mesas
  */
-export const calculateRealTableStates = (reservations = [], orders = [], manualBlocks = new Set(), selectedDate = null, selectedTurno = null, exceptions = new Set()) => {
+/**
+ * @param {object|null} timeOverlapContext Reserva “contexto” (p. ej. la nueva o la que se asigna): solo
+ *   se consideran otras reservas que solapan en tiempo con ella. null = vista mapa (todo el turno).
+ */
+export const calculateRealTableStates = (
+  reservations = [],
+  orders = [],
+  manualBlocks = new Set(),
+  selectedDate = null,
+  selectedTurno = null,
+  _exceptions = new Set(),
+  timeOverlapContext = null
+) => {
+  void _exceptions;
   const tableStates = new Map();
   
   // 1. Inicializar todas las mesas como disponibles
@@ -96,11 +113,22 @@ export const calculateRealTableStates = (reservations = [], orders = [], manualB
   
   // 4. Aplicar reservas del día/turno seleccionado
   if (selectedDate && selectedTurno) {
-    const dayReservations = reservations.filter(r => 
-      r.fecha === selectedDate && 
-      r.turno === selectedTurno &&
-      r.estadoCheckIn !== 'completado'
-    );
+    const dayReservations = reservations.filter((r) => {
+      if (r.fecha !== selectedDate || r.turno !== selectedTurno) return false;
+      if (r.status === 'cancelled') return false;
+      if (r.estadoCheckIn === 'completado') return false;
+      if (timeOverlapContext) {
+        if (r.id === timeOverlapContext.id) return false;
+        const a0 = timeOverlapContext._startsMs;
+        const a1 = timeOverlapContext._endsMs;
+        const b0 = r._startsMs;
+        const b1 = r._endsMs;
+        if (a0 && a1 && b0 && b1) {
+          return intervalsOverlap(a0, a1, b0, b1);
+        }
+      }
+      return true;
+    });
     
     dayReservations.forEach(reservation => {
       // Determinar qué mesa usar según el estado del check-in
@@ -141,7 +169,9 @@ export const calculateRealTableStates = (reservations = [], orders = [], manualB
                 time: reservation.horario,
                 checkInStatus: reservation.estadoCheckIn,
                 mesaAsignada: reservation.mesaAsignada,
-                mesaReal: reservation.mesaReal
+                mesaReal: reservation.mesaReal,
+                date: selectedDate,
+                turno: selectedTurno
               }
             });
           }
@@ -177,7 +207,8 @@ export const calculateRealTableStates = (reservations = [], orders = [], manualB
   
   // 🔍 DEBUG: Log deshabilitado para evitar spam en consola
   // Solo se habilitará para debugging específico cambiando false a true
-  if (false && process.env.NODE_ENV === 'development' && selectedDate && selectedTurno) {
+  const debugTableSummary = false;
+  if (debugTableSummary && import.meta.env.DEV && selectedDate && selectedTurno) {
     const summary = {
       available: Array.from(tableStates.values()).filter(s => s.state === 'available').length,
       reserved: Array.from(tableStates.values()).filter(s => s.state === 'reserved').length,
@@ -234,9 +265,8 @@ export const getAvailableTablesForAssignment = (tableStates, requiredCapacity, e
  * FUNCIÓN CENTRAL: Asignación automática unificada
  * Reemplaza assignTableToNewReservation y usa el estado real
  */
-export const assignTableAutomatically = (newReservation, tableStates, excludeReservationId = null) => {
-  // Asignación automática iniciada
-  
+export const assignTableAutomatically = (newReservation, tableStates, _excludeReservationId = null) => {
+  void _excludeReservationId;
   // 1. Determinar capacidad objetivo
   let capacidadObjetivo = newReservation.personas === 5 ? 6 : newReservation.personas;
   
@@ -505,7 +535,7 @@ export const checkTableAvailability = (fecha, turno, reservations = [], orders =
     // Obtener estado actual
     const currentState = tableStates.get(tableId);
     if (!currentState) {
-      if (process.env.NODE_ENV !== 'production') {
+      if (import.meta.env.DEV) {
         console.warn(`🚨 Mesa ${tableId} no tiene estado definido`);
       }
       return;
@@ -684,13 +714,61 @@ const calculateAvailabilityScore = (currentState, tableCapacity, requiredCapacit
 
 // =================== UTILIDADES ADICIONALES ===================
 
-// Alias para mantener compatibilidad con la antigua util "assignTableToNewReservation"
-export const assignTableToNewReservation = assignTableAutomatically;
+/**
+ * Compatibilidad (3 args): calcula estados con solape temporal respecto al horario de la nueva reserva.
+ */
+export async function assignTableToNewReservation(reservationData, existingReservations, blockedTables) {
+  const fecha =
+    typeof reservationData.fecha === 'string'
+      ? reservationData.fecha
+      : formatDateToString(reservationData.fecha);
+  const map = await fetchTenantReservationConfigMap();
+  const stay = getStayMinutesForTurn(map, reservationData.turno);
+  const horario = reservationData.horario;
+
+  if (!horario) {
+    const tableStates = calculateRealTableStates(
+      existingReservations,
+      [],
+      blockedTables,
+      fecha,
+      reservationData.turno,
+      new Set(),
+      null
+    );
+    return assignTableAutomatically(reservationData, tableStates);
+  }
+
+  const win = computeReservationWindow(fecha, horario, stay, RESTAURANT_TIMEZONE);
+  const overlapCtx = {
+    id: '__new__',
+    _startsMs: win.startsMs,
+    _endsMs: win.endsMs
+  };
+  const tableStates = calculateRealTableStates(
+    existingReservations,
+    [],
+    blockedTables,
+    fecha,
+    reservationData.turno,
+    new Set(),
+    overlapCtx
+  );
+  return assignTableAutomatically(reservationData, tableStates);
+}
 
 // Versión simplificada de auto-asignación masiva usada en vistas de preview
 export const calculateAutoAssignments = (reservas, currentBlocked = new Set()) => {
   const assignments = {};
-  const tableStates = calculateRealTableStates(reservas, [], currentBlocked);
+  const fecha = reservas[0]?.fecha;
+  const turno = reservas[0]?.turno;
+  const tableStates = calculateRealTableStates(
+    reservas,
+    [],
+    currentBlocked,
+    fecha || null,
+    turno || null
+  );
   const sorted = [...reservas].sort((a, b) => a.horario.localeCompare(b.horario));
 
   sorted.forEach(reserva => {

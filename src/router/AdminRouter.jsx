@@ -96,6 +96,7 @@ const AdminRouter = (props) => {
                 onUpdateReservation={props.onUpdateReservation}
                 onDeleteReservation={props.onDeleteReservation}
                 onCreateReservation={props.onSaveReservation}
+                onAdminWorkDateChange={props.onAdminWorkDateChange}
                 
                 // Props de acciones sobre lista de espera
                 onConfirmWaitingReservation={props.onConfirmWaitingReservation}

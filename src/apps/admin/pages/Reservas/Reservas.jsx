@@ -19,16 +19,21 @@ import "../../../../datepicker-custom.css";
 import { formatPhoneForWhatsApp } from '../../../../utils/phoneUtils';
 import { formatDateToString } from '../../../../utils';
 import { DEFAULT_WALKIN_TABLES } from '../../../../utils/tablesLayout';
-import { calculateAvailableSlots, isValidReservationDate } from '../../../../shared/services/reservationService';
+import {
+  calculateAvailableSlots,
+  isValidReservationDate,
+  clearAllTableAssignments,
+  DEFAULT_HORARIOS
+} from '../../../../shared/services/reservationService';
 import CheckInService from '../../../../shared/services/CheckInService';
+import { toggleTableBlock } from '../../../../shared/services/tableManagementService';
 import InteractiveMapController from '../../../../shared/components/InteractiveMap/InteractiveMapController';
 import CreateReservationModal from '../../../../shared/components/modals/CreateReservationModal';
 import EditReservationModal from '../../../../shared/components/modals/EditReservationModal';
 import { useTableStates } from '../../../../shared/hooks/useTableStates';
-import { saveTableBlocksForDateTurno, loadTableBlocksForDateTurno } from '../../../../firebase';
+import { loadVenueBlocks, saveVenueBlocks } from '../../../../shared/services/supabaseReservationRepository';
 
 import styles from './Reservas.module.css';
-import mapStyles from '../../../../shared/components/InteractiveMap/InteractiveMapController.module.css';
 
 // Registrar locale español para el DatePicker
 registerLocale('es', es);
@@ -41,14 +46,16 @@ const Reservas = ({
   formatDate, 
   HORARIOS = DEFAULT_HORARIOS, 
   showNotification,
-  onCreateReservation
+  onCreateReservation,
+  onConfirmWaitingReservation,
+  onRejectWaitingReservation,
+  onContactWaitingClient,
+  onAdminWorkDateChange
 }) => {
   // ============== ESTADOS PRINCIPALES ==============
-  const [orders] = useState([]); // Sin pedidos en sistema de reservas
   const [selectedDate, setSelectedDate] = useState(new Date());
   const [selectedTurno, setSelectedTurno] = useState('mediodia');
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
-  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [editingReservation, setEditingReservation] = useState(null);
   const [checkInMode, setCheckInMode] = useState(false); // Modo check-in activo
   const [selectedReservationForCheckIn, setSelectedReservationForCheckIn] = useState(null);
@@ -61,8 +68,6 @@ const Reservas = ({
   const [tableManagementMode, setTableManagementMode] = useState(false); // Modo gestión de mesas
   const [reservationPopup, setReservationPopup] = useState(null); // Popup de información
   const [confirmation, setConfirmation] = useState(null); // Estado para modales de confirmación
-  const [loading, setLoading] = useState(true);
-  const [notifications, setNotifications] = useState([]);
 
   // 🆕 ESTADOS PARA BLOQUEO DE MESAS POR FECHA Y TURNO
   const [blockedTables, setBlockedTables] = useState(new Set()); // Mesas bloqueadas para la fecha/turno actual
@@ -71,16 +76,15 @@ const Reservas = ({
   // Memoizar dependencias para evitar recálculos innecesarios
   const formattedDate = useMemo(() => formatDateToString(selectedDate), [selectedDate]);
   
-  // Función para cargar configuración de mesas bloqueadas desde Firebase
   const loadBlockedTables = useCallback(async () => {
     try {
       const fechaString = formatDateToString(selectedDate);
-      const config = await loadTableBlocksForDateTurno(fechaString, selectedTurno);
-      setBlockedTables(new Set(config.blockedTables));
+      const nums = await loadVenueBlocks(fechaString, selectedTurno);
+      const arr = nums?.length ? nums : [];
+      setBlockedTables(arr.length ? new Set(arr) : new Set(DEFAULT_WALKIN_TABLES));
       setHasUnsavedChanges(false);
     } catch (error) {
       console.error('❌ Error al cargar configuración de mesas:', error);
-      // En caso de error, usar configuración predeterminada
       setBlockedTables(new Set(DEFAULT_WALKIN_TABLES));
     }
   }, [selectedDate, selectedTurno]);
@@ -89,9 +93,15 @@ const Reservas = ({
     loadBlockedTables();
   }, [loadBlockedTables]);
 
+  useEffect(() => {
+    if (onAdminWorkDateChange) {
+      onAdminWorkDateChange(formatDateToString(selectedDate));
+    }
+  }, [selectedDate, onAdminWorkDateChange]);
+
   const emptyOrders = useMemo(() => [], []); // Array vacío memoizado
 
-  const { tableStates, occupiedTables, reservedTables, availableTables, tableAssignments, findOccupantByTable, getTableState, isTableOccupied, stats } = useTableStates(
+  const { tableStates, occupiedTables, tableAssignments, findOccupantByTable } = useTableStates(
     reservations,
     emptyOrders,
     blockedTables,
@@ -111,10 +121,13 @@ const Reservas = ({
   const filteredWaitingList = useMemo(() => {
     if (!waitingList) return [];
     const fechaSeleccionada = formatDateToString(selectedDate);
-    return waitingList.filter(waiting => 
-      waiting.fecha === fechaSeleccionada && waiting.status !== 'rejected'
+    return waitingList.filter(
+      (waiting) =>
+        waiting.fecha === fechaSeleccionada &&
+        waiting.turno === selectedTurno &&
+        waiting.status !== 'rejected'
     );
-  }, [waitingList, selectedDate]);
+  }, [waitingList, selectedDate, selectedTurno]);
 
   // ============== FUNCIONES BÁSICAS ==============
 
@@ -136,8 +149,7 @@ const Reservas = ({
       if (result.success) {
         showNotification?.(`Reserva creada exitosamente${result.mesaAsignada ? ` - Mesa ${result.mesaAsignada}` : ''}`, 'success');
         
-        // ✅ NO llamar onCreateReservation - el servicio unificado ya guardó la reserva
-        // La reserva ya está creada en Firebase, solo mostrar notificación
+        // El servicio unificado ya persistió en Supabase; no duplicar onCreateReservation
       }
 
       return result;
@@ -155,11 +167,14 @@ const Reservas = ({
 
   const hasCheckedIn = CheckInService.hasCheckedIn;
 
-  const handleCheckIn = useCallback(async (reserva) => {
-    await CheckInService.performCheckIn(reserva, showNotification);
-    setCheckInMode(false);
-    setSelectedReservationForCheckIn(null);
-  }, [showNotification]);
+  const handleCheckInComplete = useCallback(
+    async (reserva, mesaId) => {
+      await CheckInService.performCheckIn(reserva, mesaId, showNotification);
+      setCheckInMode(false);
+      setSelectedReservationForCheckIn(null);
+    },
+    [showNotification]
+  );
 
   // ============== FUNCIONES DE GESTIÓN DE RESERVAS ==============
   
@@ -186,20 +201,12 @@ const Reservas = ({
       message: `¿Estás seguro de que quieres cancelar la reserva de ${reserva.cliente?.nombre}?`,
       onConfirm: async () => {
         try {
-          // Debugging completo del objeto reserva
-          console.log('🔍 DEBUG - Reserva completa:', reserva);
-          console.log('🔍 DEBUG - Tipo de reserva:', typeof reserva);
-          console.log('🔍 DEBUG - Propiedades:', Object.keys(reserva));
-          
-          // Verificar si la reserva está anidada dentro de otro objeto
           const reservaData = reserva.reserva || reserva;
-          
+
           if (!reservaData || !reservaData.id) {
-            console.error('❌ Reserva inválida:', { reserva, reservaData });
             throw new Error('ID de reserva no encontrado');
           }
-          
-          console.log('🗑️ Eliminando reserva con ID:', reservaData.id);
+
           await onDeleteReservation(reservaData.id);
           showNotification('Reserva cancelada correctamente', 'success');
           setReservationPopup(null); // Cerrar popup
@@ -294,64 +301,86 @@ const Reservas = ({
   }, []);
 
   // Función para contactar cliente en lista de espera
-  const handleContactWaitingClient = useCallback((waiting) => {
-    if (waiting.cliente?.telefono) {
-      const phoneNumber = formatPhoneForWhatsApp(waiting.cliente.telefono);
-      const message = `Hola ${waiting.cliente.nombre}, te contactamos desde Rosaura. Tenemos disponibilidad para tu solicitud de reserva para ${waiting.personas} personas el ${waiting.fecha}.`;
-      const whatsappUrl = `https://wa.me/${phoneNumber}?text=${encodeURIComponent(message)}`;
-      window.open(whatsappUrl, '_blank');
-      
-      // Marcar como contactado (aquí necesitarías una función para actualizar el estado)
-      showNotification(`Contactando a ${waiting.cliente.nombre}`, 'info');
-    } else {
-      showNotification('No hay número de teléfono disponible', 'warning');
-    }
-  }, [showNotification]);
-
-  // Función para confirmar rápidamente desde lista de espera
-  const handleQuickConfirmWaiting = useCallback((waiting) => {
-    setConfirmation({
-      title: 'Confirmar desde Lista de Espera',
-      message: `¿Convertir la solicitud de ${waiting.cliente?.nombre} en una reserva confirmada?`,
-      onConfirm: async () => {
+  const handleContactWaitingClient = useCallback(
+    async (waiting) => {
+      if (waiting.cliente?.telefono) {
+        const phoneNumber = formatPhoneForWhatsApp(waiting.cliente.telefono);
+        const message = `Hola ${waiting.cliente.nombre}, te contactamos desde Rosaura. Tenemos disponibilidad para tu solicitud de reserva para ${waiting.personas} personas el ${waiting.fecha}.`;
+        const whatsappUrl = `https://wa.me/${phoneNumber}?text=${encodeURIComponent(message)}`;
+        window.open(whatsappUrl, '_blank');
         try {
-          // Aquí necesitarías implementar la lógica para convertir waiting a reserva
-          console.log('Convirtiendo waiting a reserva:', waiting);
-          showNotification('Funcionalidad en desarrollo: Convertir a reserva', 'info');
-        } catch (error) {
-          console.error('Error al confirmar desde lista de espera:', error);
-          showNotification('Error al procesar la confirmación', 'error');
+          if (onContactWaitingClient) await onContactWaitingClient(waiting.id);
+        } catch (e) {
+          console.error(e);
         }
-      },
-      onCancel: () => setConfirmation(null)
-    });
-  }, [showNotification]);
+        showNotification(`Contactando a ${waiting.cliente.nombre}`, 'info');
+      } else {
+        showNotification('No hay número de teléfono disponible', 'warning');
+      }
+    },
+    [showNotification, onContactWaitingClient]
+  );
 
-  // Función para rechazar desde lista de espera
-  const handleRejectWaiting = useCallback((waiting) => {
-    setConfirmation({
-      title: 'Rechazar Solicitud',
-      message: `¿Estás seguro de que quieres rechazar la solicitud de ${waiting.cliente?.nombre}?`,
-      onConfirm: async () => {
-        try {
-          // Aquí necesitarías implementar la lógica para rechazar waiting
-          console.log('Rechazando solicitud:', waiting);
-          showNotification('Funcionalidad en desarrollo: Rechazar solicitud', 'info');
-        } catch (error) {
-          console.error('Error al rechazar solicitud:', error);
-          showNotification('Error al rechazar la solicitud', 'error');
-        }
-      },
-      onCancel: () => setConfirmation(null)
-    });
-  }, [showNotification]);
+  const handleQuickConfirmWaiting = useCallback(
+    (waiting) => {
+      setConfirmation({
+        title: 'Confirmar desde Lista de Espera',
+        message: `¿Convertir la solicitud de ${waiting.cliente?.nombre} en una reserva confirmada?`,
+        onConfirm: async () => {
+          try {
+            const slots = await getAvailableSlots(waiting.fecha, waiting.turno);
+            const ok = slots.filter((s) => s.cuposDisponibles > 0);
+            if (ok.length === 0) {
+              showNotification('No hay cupos disponibles para ese turno', 'warning');
+              return;
+            }
+            const horario = ok[0].horario;
+            await onConfirmWaitingReservation(
+              waiting.id,
+              { ...waiting, horario },
+              horario,
+              blockedTables
+            );
+            showNotification('Reserva confirmada desde lista de espera', 'success');
+          } catch (error) {
+            console.error('Error al confirmar desde lista de espera:', error);
+            showNotification(error.message || 'Error al procesar la confirmación', 'error');
+          }
+        },
+        onCancel: () => setConfirmation(null)
+      });
+    },
+    [getAvailableSlots, reservations, blockedTables, onConfirmWaitingReservation, showNotification]
+  );
+
+  const handleRejectWaiting = useCallback(
+    (waiting) => {
+      setConfirmation({
+        title: 'Rechazar Solicitud',
+        message: `¿Estás seguro de que quieres rechazar la solicitud de ${waiting.cliente?.nombre}?`,
+        onConfirm: async () => {
+          try {
+            await onRejectWaitingReservation(waiting.id, '');
+            showNotification('Solicitud rechazada', 'success');
+          } catch (error) {
+            console.error('Error al rechazar solicitud:', error);
+            showNotification('Error al rechazar la solicitud', 'error');
+          }
+        },
+        onCancel: () => setConfirmation(null)
+      });
+    },
+    [onRejectWaitingReservation, showNotification]
+  );
 
   // ============== FUNCIONES DE GESTIÓN DE MESAS ==============
 
   // Auto-asignación UNIFICADA usando el nuevo servicio
   const handleAutoAssign = useCallback(async () => {
     try {
-      const { assignTableAutomatically } = await import('../../../../shared/services/tableManagementService');
+      const { assignTableAutomatically, calculateRealTableStates } = await import(
+        '../../../../shared/services/tableManagementService'
+      );
       
     const fechaSeleccionada = formatDateToString(selectedDate);
       const reservasSinMesa = reservations.filter(r => 
@@ -370,8 +399,16 @@ const Reservas = ({
       let noAsignadas = [];
 
       for (const reserva of reservasSinMesa) {
-        // ✅ USAR ASIGNACIÓN AUTOMÁTICA UNIFICADA
-        const mesaAsignada = assignTableAutomatically(reserva, tableStates);
+        const statesForReserva = calculateRealTableStates(
+          reservations,
+          emptyOrders,
+          blockedTables,
+          fechaSeleccionada,
+          selectedTurno,
+          new Set(),
+          reserva
+        );
+        const mesaAsignada = assignTableAutomatically(reserva, statesForReserva);
         
         if (mesaAsignada) {
           await onUpdateReservation(reserva.id, { mesaAsignada }, true);
@@ -394,7 +431,7 @@ const Reservas = ({
       console.error('Error en autoasignación:', error);
       showNotification?.('Error al autoasignar reservas', 'error');
     }
-  }, [reservations, selectedDate, selectedTurno, tableStates, onUpdateReservation, showNotification]);
+  }, [reservations, selectedDate, selectedTurno, onUpdateReservation, showNotification]);
 
   const handleClearAssignments = useCallback(async () => {
     const fechaSeleccionada = formatDateToString(selectedDate);
@@ -437,7 +474,6 @@ const Reservas = ({
       setHasUnsavedChanges(true);
     } else {
       // 🔄 MODO NORMAL: Funcionalidad original de bloqueo/desbloqueo
-      const { toggleTableBlock } = require('../../../shared/services/tableManagementService');
       const result = toggleTableBlock(tableId, blockedTables, tableStates);
       
       if (result.success) {
@@ -449,15 +485,10 @@ const Reservas = ({
     }
   }, [blockedTables, tableStates, showNotification, tableManagementMode]);
 
-  // Guardar cambios de bloqueo en Firebase
   const handleSaveTableChanges = useCallback(async () => {
     try {
       const fechaString = formatDateToString(selectedDate);
-      await saveTableBlocksForDateTurno(
-        fechaString,
-        selectedTurno,
-        Array.from(blockedTables)
-      );
+      await saveVenueBlocks(fechaString, selectedTurno, Array.from(blockedTables));
       setHasUnsavedChanges(false);
       const formattedDateForDisplay = new Date(selectedDate).toLocaleDateString('es-AR');
       showNotification?.(`✅ Configuración de mesas para ${formattedDateForDisplay} - ${selectedTurno} guardada`, 'success');
@@ -500,7 +531,7 @@ const Reservas = ({
 
   // ============== FUNCIÓN DE ASIGNACIÓN MANUAL DE MESA ==============
   
-  const handleAssignTable = useCallback(async (tableId, tableInfo) => {
+  const handleAssignTable = useCallback(async (tableId) => {
     if (!selectedReservationForAssignment) return;
     
     const tableState = tableStates.get(tableId);
@@ -567,10 +598,14 @@ const Reservas = ({
   }, [selectedReservationForAssignment, tableStates, onUpdateReservation, showNotification]);
 
   // Función para manejar click en mesa
-  const handleTableClick = useCallback((tableId, tableInfo) => {
+  const handleTableClick = useCallback(async (tableId, tableInfo) => {
     if (checkInMode && selectedReservationForCheckIn) {
-      // Modo check-in
-      handleCheckIn(selectedReservationForCheckIn);
+      try {
+        await handleCheckInComplete(selectedReservationForCheckIn, tableId);
+      } catch {
+        /* notificación en servicio */
+      }
+      return;
     } else if (assignmentMode && selectedReservationForAssignment) {
       // Modo asignación de mesa
       handleAssignTable(tableId, tableInfo);
@@ -578,8 +613,6 @@ const Reservas = ({
       // Modo normal - verificar si la mesa tiene una reserva usando el estado unificado
       if (tableInfo && tableInfo.type === 'reservation') {
         // Mesa tiene reserva - mostrar popup de información
-        console.log('🪑 Mesa reservada clickeada:', tableId, 'Reserva:', tableInfo.details?.clientName);
-        
         // Reconstruir objeto de reserva desde tableInfo
         const reservaFromTable = {
           id: tableInfo.details?.reservationId,
@@ -590,8 +623,8 @@ const Reservas = ({
           },
           personas: tableInfo.details?.people,
           horario: tableInfo.details?.time,
-          fecha: tableInfo.details?.date,
-          turno: tableInfo.details?.turno,
+          fecha: tableInfo.details?.date || formattedDate,
+          turno: tableInfo.details?.turno || selectedTurno,
           mesaAsignada: tableInfo.details?.mesaAsignada,
           mesaReal: tableInfo.details?.mesaReal,
           estadoCheckIn: tableInfo.details?.checkInStatus,
@@ -599,12 +632,21 @@ const Reservas = ({
         };
         
         handleShowReservationPopup(reservaFromTable);
-      } else {
-        // Mesa libre - comportamiento normal
-        console.log('🪑 Mesa libre clickeada:', tableId);
       }
     }
-  }, [checkInMode, selectedReservationForCheckIn, assignmentMode, selectedReservationForAssignment, handleCheckIn, handleAssignTable, showNotification, tableStates, handleShowReservationPopup]);
+  }, [
+    checkInMode,
+    selectedReservationForCheckIn,
+    assignmentMode,
+    selectedReservationForAssignment,
+    handleCheckInComplete,
+    handleAssignTable,
+    showNotification,
+    tableStates,
+    handleShowReservationPopup,
+    formattedDate,
+    selectedTurno
+  ]);
 
   // ============== FUNCIONES AUXILIARES ==============
 

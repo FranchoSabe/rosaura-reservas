@@ -34,9 +34,15 @@ const ReservationDetails = ({ reservation, onClose, formatDate, onEdit, onCancel
         </div>
         <div className={styles.detailItem}>
           <p className={styles.detailLabel}>Nombre</p>
-          <p className={styles.detailValue}>{reservation.cliente.nombre}</p>
+          <p className={styles.detailValue}>
+            {reservation.cliente?.nombre?.trim()
+              ? reservation.cliente.nombre
+              : reservation._publicPhoneSummary
+                ? '— (no mostrado en búsqueda por teléfono)'
+                : '—'}
+          </p>
         </div>
-        {reservation.cliente.comentarios && (
+        {reservation.cliente?.comentarios && (
           <div className={styles.detailItem}>
             <p className={styles.detailLabel}>Comentarios</p>
             <p className={styles.detailValue}>{reservation.cliente.comentarios}</p>

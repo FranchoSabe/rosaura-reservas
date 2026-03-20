@@ -3,6 +3,24 @@ import { Clock, Users, CheckCircle, UserCheck, Phone } from 'lucide-react';
 import { formatPhoneForWhatsApp } from '../../../../../../utils/phoneUtils';
 import styles from '../../Reservas.module.css';
 
+function formatCheckInTime(horaLlegada) {
+  if (!horaLlegada) return '';
+  if (horaLlegada instanceof Date && !Number.isNaN(horaLlegada.getTime())) {
+    return horaLlegada.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' });
+  }
+  if (typeof horaLlegada === 'string' || typeof horaLlegada === 'number') {
+    const d = new Date(horaLlegada);
+    return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' });
+  }
+  if (horaLlegada?.seconds != null) {
+    return new Date(horaLlegada.seconds * 1000).toLocaleTimeString('es-AR', {
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  }
+  return '';
+}
+
 /**
  * Lista de reservas con toda la lógica de visualización y interacción
  */
@@ -88,12 +106,7 @@ const ReservationsList = ({
               {hasCheckedIn(reserva) ? (
                 <div className={styles.checkedInIndicator}>
                   <CheckCircle size={14} />
-                  <span>
-                    Llegó a las {reserva.horaLlegada && 
-                      new Date(reserva.horaLlegada.seconds ? reserva.horaLlegada.seconds * 1000 : reserva.horaLlegada)
-                        .toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })
-                    }
-                  </span>
+                  <span>Llegó a las {formatCheckInTime(reserva.horaLlegada)}</span>
                 </div>
               ) : (
                 <button
